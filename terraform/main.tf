@@ -1,0 +1,94 @@
+terraform {
+  required_version = ">= 1.6.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+# ---------------- Networking ----------------
+module "networking" {
+  source = "./modules/networking"
+  azs    = var.azs
+}
+
+# ---------------- EKS ----------------
+module "eks" {
+  source              = "./modules/eks"
+  vpc_id              = module.networking.vpc_id
+  private_subnet_ids  = module.networking.private_subnet_ids
+  public_subnet_ids   = module.networking.public_subnet_ids
+}
+
+# ---------------- Storage (S3 frontend + ECR) ----------------
+module "storage" {
+  source = "./modules/storage"
+}
+
+# ---------------- Backend ALB lookup ----------------
+# The ALB is created by the AWS Load Balancer Controller (running on EKS) when the
+# backend Ingress resource is applied via GitHub Actions / kubectl — NOT by Terraform
+# directly, since it depends on the cluster and controller existing first.
+# This data source looks it up by tag on a second `terraform apply` once the backend
+# is deployed. See scripts/deploy-infrastructure.sh for the two-phase apply flow.
+data "aws_lb" "backend" {
+  tags = {
+    "elbv2.k8s.aws/cluster" = module.eks.cluster_name
+  }
+
+  depends_on = [module.eks]
+}
+
+# ---------------- CDN (unified CloudFront: S3 + ALB origins) ----------------
+module "cdn" {
+  source                         = "./modules/cdn"
+  s3_bucket_regional_domain_name = module.storage.bucket_regional_domain_name
+  s3_bucket_id                   = module.storage.bucket_id
+  alb_dns_name                   = data.aws_lb.backend.dns_name
+}
+
+# Bucket policy granting CloudFront (OAC) read access — defined at root level to
+# avoid a circular dependency between the storage and cdn modules.
+resource "aws_s3_bucket_policy" "frontend_oac" {
+  bucket = module.storage.bucket_id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "AllowCloudFrontOAC"
+      Effect    = "Allow"
+      Principal = { Service = "cloudfront.amazonaws.com" }
+      Action    = "s3:GetObject"
+      Resource  = "${module.storage.bucket_arn}/*"
+      Condition = {
+        StringEquals = {
+          "AWS:SourceArn" = module.cdn.distribution_arn
+        }
+      }
+    }]
+  })
+}
+
+# ---------------- Database (ElastiCache Redis) ----------------
+module "database" {
+  source                        = "./modules/database"
+  vpc_id                        = module.networking.vpc_id
+  vpc_cidr_block                = module.networking.vpc_cidr_block
+  database_subnet_ids           = module.networking.database_subnet_ids
+  eks_worker_security_group_id  = module.eks.cluster_security_group_id
+}
