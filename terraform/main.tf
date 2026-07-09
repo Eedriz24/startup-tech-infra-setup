@@ -100,7 +100,7 @@ terraform {
     bucket         = "starttech-tfstate-bucket"
     key            = "starttech-infra/terraform.tfstate"
     region         = "us-east-1"
-    use_lockfile   = true
+    dynamodb_table = "starttech-tf-lock"
     encrypt        = true
   }
 }
