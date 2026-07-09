@@ -1,5 +1,4 @@
-name: Infrastructure & Application Deployment
-
+name: Infrastructure Deployment
 on:
   push:
     branches: [main]
@@ -43,7 +42,15 @@ jobs:
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform init
 
-      - name: Terraform Apply (skip CDN/ALB data source on first pass)
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan \
+          -target=module.networking \
+          -target=module.eks \
+          -target=module.storage \
+          -target=module.database
+
+      - name: Terraform Apply 
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
           terraform apply -auto-approve \
@@ -51,132 +58,14 @@ jobs:
             -target=module.eks \
             -target=module.storage \
             -target=module.database \
-            -var="mongodb_atlas_uri=${{ secrets.MONGODB_ATLAS_URI }}"
 
       - name: Capture outputs
         id: tf_outputs
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: |
           echo "ecr_repo_url=$(terraform output -raw ecr_repository_url)" >> "$GITHUB_OUTPUT"
-          echo "frontend_bucket=$(terraform output -raw frontend_bucket_id)" >> "$GITHUB_OUTPUT"
 
-  # ---------------------------------------------------------------
-  # 2. Build & push backend Docker image to ECR
-  # ---------------------------------------------------------------
-  build-backend:
-    name: Build & Push Backend Image
-    needs: terraform-infra
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to ECR
-        id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build, tag, push image
-        working-directory: backend
-        run: |
-          IMAGE_URI="${{ needs.terraform-infra.outputs.ecr_repo_url }}:${{ github.sha }}"
-          docker build -t "$IMAGE_URI" .
-          docker push "$IMAGE_URI"
-          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
-
-  # ---------------------------------------------------------------
-  # 3. Deploy backend to EKS (Deployment + Service + Ingress)
-  # ---------------------------------------------------------------
-  deploy-to-eks:
-    name: Deploy Backend to EKS
-    needs: [terraform-infra, build-backend]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Update kubeconfig
-        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
-
-      - name: Deploy manifests
-        run: |
-          kubectl apply -f k8s/deployment.yaml
-          kubectl apply -f k8s/service.yaml
-          kubectl apply -f k8s/ingress.yaml
-          kubectl set image deployment/starttech-backend-api \
-            backend=${{ needs.build-backend.outputs.image_uri }} --record
-
-  # ---------------------------------------------------------------
-  # 4. Build & sync React frontend to S3
-  # ---------------------------------------------------------------
-  build-frontend:
-    name: Build & Deploy Frontend
-    needs: terraform-infra
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install & build
-        working-directory: frontend
-        run: |
-          npm ci
-          npm run build
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Sync to S3
-        run: |
-          aws s3 sync frontend/build/ s3://${{ needs.terraform-infra.outputs.frontend_bucket }} --delete
-
-  # ---------------------------------------------------------------
-  # 5. Second Terraform pass: create CloudFront now that ALB exists
-  # ---------------------------------------------------------------
-  terraform-cdn:
-    name: Terraform Apply (CDN)
-    needs: [deploy-to-eks, build-frontend]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.7.5"
-
-      - name: Terraform Init
+      - name: Terraform Destroy (cleanup)
+        if: ${{ always() }}
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform init
-
-      - name: Terraform Apply (full, including CDN)
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: |
-          terraform apply -auto-approve \
-            -var="mongodb_atlas_uri=${{ secrets.MONGODB_ATLAS_URI }}"
-
-      - name: Invalidate CloudFront cache
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: |
-          DIST_ID=$(terraform output -raw cloudfront_distribution_id)
-          aws cloudfront create-invalidation --distribution-id "$DIST_ID" --paths "/*"
+        run: terraform destroy -auto-approve

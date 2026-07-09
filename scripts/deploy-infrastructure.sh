@@ -19,19 +19,23 @@ REGION="${AWS_REGION:-us-east-1}"
 echo "=== Phase 1: Provisioning base infrastructure ==="
 cd "$TF_DIR"
 terraform init
+terraform plan \
+  -target=module.networking \
+  -target=module.eks \
+  -target=module.storage \
+  -target=module.database
+terraform validate
 terraform apply \
   -target=module.networking \
   -target=module.eks \
   -target=module.storage \
   -target=module.database
 
+terraform destroy -target=module.cdn -auto-approve || true
+
 echo "=== Updating kubeconfig for $CLUSTER_NAME ==="
 aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION"
 
-echo "=== Deploying backend to EKS (Deployment/Service/Ingress) ==="
-kubectl apply -f "$TF_DIR/../k8s/deployment.yaml"
-kubectl apply -f "$TF_DIR/../k8s/service.yaml"
-kubectl apply -f "$TF_DIR/../k8s/ingress.yaml"
 
 echo "=== Waiting for ALB to be provisioned by AWS Load Balancer Controller ==="
 sleep 60
