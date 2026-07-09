@@ -93,3 +93,14 @@ module "database" {
   database_subnet_ids           = module.networking.database_subnet_ids
   eks_worker_security_group_id  = module.eks.cluster_security_group_id
 }
+
+
+terraform {
+  backend "s3" {
+    bucket         = "starttech-tfstate-bucket"
+    key            = "starttech-infra/terraform.tfstate"
+    region         = "us-east-1"
+    use_lockfile   = true
+    encrypt        = true
+  }
+}
