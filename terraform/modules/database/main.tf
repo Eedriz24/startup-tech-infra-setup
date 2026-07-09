@@ -1,6 +1,9 @@
 resource "aws_elasticache_subnet_group" "starttech" {
   name       = "starttech-redis-subnet-group"
   subnet_ids = var.database_subnet_ids
+  lifecycle {
+    ignore_changes = [subnet_ids]
+  }
 }
 
 resource "aws_security_group" "redis" {
